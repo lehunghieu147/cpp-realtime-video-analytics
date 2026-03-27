@@ -1,0 +1,24 @@
+# Build
+build/
+cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Models (large binaries)
+models/*.onnx
+models/*.pt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Project Notes & Plans
+note/
+plans/
