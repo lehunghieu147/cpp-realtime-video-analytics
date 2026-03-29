@@ -22,6 +22,7 @@ struct CameraUnit {
   cv::Mat sharedFrame;
   std::mutex mtx;
   std::atomic<bool> hasNew{false};
+  std::atomic<bool> alive{true};  // false when camera disconnects
 };
 
 // ── Detect available cameras ──────────────────────────────────────────────────
@@ -40,11 +41,22 @@ std::vector<int> detectCameras(int maxIndex = 10) {
 // ── Grab thread ───────────────────────────────────────────────────────────────
 void grabThread(CameraUnit& cam, std::atomic<bool>& running) {
   cv::Mat tmp;
-  while (running) {
+  int failCount = 0;
+  const int kMaxFails = 30;  // 30 × 10ms = ~300ms before declaring disconnect
+
+  while (running && cam.alive) {
     if (!cam.capture->read(tmp)) {
+      failCount++;
+      if (failCount >= kMaxFails) {
+        std::cerr << cam.label << ": camera disconnected after "
+                  << kMaxFails << " consecutive failures\n";
+        cam.alive = false;
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
+    failCount = 0;  // reset on successful read
 
     std::lock_guard<std::mutex> lock(cam.mtx);
     cam.sharedFrame = tmp.clone();
@@ -122,7 +134,12 @@ int main() {
 
   // ── Main loop ───────────────────────────────────────────────────────────────
   while (true) {
+    bool anyAlive = false;
+
     for (auto& cam : cameras) {
+      if (!cam->alive) continue;  // skip dead cameras
+      anyAlive = true;
+
       if (cam->hasNew) {
         {
           std::lock_guard<std::mutex> lock(cam->mtx);
@@ -139,6 +156,11 @@ int main() {
                     cam->frameCount);
         cv::imshow(cam->label, cam->latestFrame);
       }
+    }
+
+    if (!anyAlive) {
+      std::cerr << "All cameras disconnected, exiting\n";
+      break;
     }
 
     if (cv::waitKey(1) == 'q') break;
