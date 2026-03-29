@@ -7,6 +7,7 @@
 bool OpenCvCapture::open(const CaptureConfig& config) {
   config_ = config;
 
+  // cap_.open(config.deviceIndex, cv::CAP_V4L2);
   cap_.open(config.deviceIndex);
   if (!cap_.isOpened()) {
     std::cerr << "Failed to open camera " << config.deviceIndex << "\n";

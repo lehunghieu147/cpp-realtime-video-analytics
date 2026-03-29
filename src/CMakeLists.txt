@@ -5,6 +5,7 @@ add_executable(video_analytics
     inference/inference-engine.cpp
     inference/pre-process.cpp
     inference/post-process.cpp
+    pipeline/pipeline.cpp
 )
 
 # Link dependencies
