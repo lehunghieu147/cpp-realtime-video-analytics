@@ -29,3 +29,4 @@ find_package(ONNXRuntime REQUIRED)
 
 # --- Subdirectories ---
 add_subdirectory(src)
+add_subdirectory(tests)
