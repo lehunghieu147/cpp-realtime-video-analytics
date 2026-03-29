@@ -9,6 +9,12 @@
 #include "utils/fps-tracker.hpp"
 
 // ── All state for a single camera ─────────────────────────────────────────────
+// Double buffer design:
+//   buffers[0] and buffers[1] are pre-allocated cv::Mat.
+//   writeIdx = index grab thread writes into (owned by grab thread).
+//   When grab thread finishes a frame → lock, swap writeIdx, set hasNew.
+//   Main thread reads from buffers[1 - writeIdx] (the "other" buffer).
+//   Result: only 1 clone (cap→buffer) instead of 2. Swap is just an int flip.
 struct CameraUnit {
   std::unique_ptr<IVideoCapture> capture;
   std::string label;
@@ -16,13 +22,15 @@ struct CameraUnit {
   std::thread thread;
   FpsTracker tracker;
   int frameCount = 0;
-  cv::Mat latestFrame;
+  cv::Mat displayFrame;
 
-  // Shared state between grab thread and main thread
-  cv::Mat sharedFrame;
+  // Double buffer: grab thread writes to buffers[writeIdx],
+  // main thread reads from buffers[1 - writeIdx]
+  cv::Mat buffers[2];
+  int writeIdx = 0;
   std::mutex mtx;
   std::atomic<bool> hasNew{false};
-  std::atomic<bool> alive{true};  // false when camera disconnects
+  std::atomic<bool> alive{true};
 };
 
 // ── Detect available cameras ──────────────────────────────────────────────────
@@ -40,12 +48,14 @@ std::vector<int> detectCameras(int maxIndex = 10) {
 
 // ── Grab thread ───────────────────────────────────────────────────────────────
 void grabThread(CameraUnit& cam, std::atomic<bool>& running) {
-  cv::Mat tmp;
   int failCount = 0;
-  const int kMaxFails = 30;  // 30 × 10ms = ~300ms before declaring disconnect
+  const int kMaxFails = 30;
 
   while (running && cam.alive) {
-    if (!cam.capture->read(tmp)) {
+    // Read directly into the write buffer — no intermediate tmp needed
+    cv::Mat& writeBuf = cam.buffers[cam.writeIdx];
+
+    if (!cam.capture->read(writeBuf)) {
       failCount++;
       if (failCount >= kMaxFails) {
         std::cerr << cam.label << ": camera disconnected after "
@@ -56,11 +66,14 @@ void grabThread(CameraUnit& cam, std::atomic<bool>& running) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
-    failCount = 0;  // reset on successful read
+    failCount = 0;
 
-    std::lock_guard<std::mutex> lock(cam.mtx);
-    cam.sharedFrame = tmp.clone();
-    cam.hasNew = true;
+    // Swap: flip writeIdx so main thread reads the buffer we just filled
+    {
+      std::lock_guard<std::mutex> lock(cam.mtx);
+      cam.writeIdx = 1 - cam.writeIdx;  // 0→1 or 1→0
+      cam.hasNew = true;
+    }
   }
 }
 
@@ -143,18 +156,19 @@ int main() {
       if (cam->hasNew) {
         {
           std::lock_guard<std::mutex> lock(cam->mtx);
-          cam->latestFrame = cam->sharedFrame.clone();
+          // Read from the buffer that grab thread is NOT writing to
+          cam->displayFrame = cam->buffers[1 - cam->writeIdx];
           cam->hasNew = false;
         }
         cam->tracker.update();
         cam->frameCount++;
-        cam->writer.write(cam->latestFrame);
+        cam->writer.write(cam->displayFrame);
       }
 
-      if (!cam->latestFrame.empty()) {
-        drawOverlay(cam->latestFrame, cam->label, cam->tracker.fps,
+      if (!cam->displayFrame.empty()) {
+        drawOverlay(cam->displayFrame, cam->label, cam->tracker.fps,
                     cam->frameCount);
-        cv::imshow(cam->label, cam->latestFrame);
+        cv::imshow(cam->label, cam->displayFrame);
       }
     }
 
