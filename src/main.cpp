@@ -1,4 +1,6 @@
 #include "pipeline/pipeline.hpp"
+#include "server/sse-server.hpp"
+#include "server/result-serializer.hpp"
 #include "inference/detection.hpp"
 #include "utils/fps-tracker.hpp"
 
@@ -19,7 +21,6 @@ void drawDetections(cv::Mat& frame,
                  static_cast<int>(det.bbox.width),
                  static_cast<int>(det.bbox.height));
 
-    // Color based on class ID for visual variety
     cv::Scalar color(
         static_cast<int>(det.classId * 50) % 256,
         static_cast<int>(det.classId * 80 + 100) % 256,
@@ -27,17 +28,14 @@ void drawDetections(cv::Mat& frame,
 
     cv::rectangle(frame, box, color, 2);
 
-    // Label: "person 0.92"
     std::string label = std::string(getClassName(det.classId)) + " " +
                         cv::format("%.2f", det.confidence);
 
-    // Background rectangle for label readability
     int baseline = 0;
     cv::Size textSize =
         cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
     cv::rectangle(frame, cv::Point(box.x, box.y - textSize.height - 6),
-                  cv::Point(box.x + textSize.width + 4, box.y),
-                  color, -1);
+                  cv::Point(box.x + textSize.width + 4, box.y), color, -1);
     cv::putText(frame, label, cv::Point(box.x + 2, box.y - 4),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
   }
@@ -56,12 +54,13 @@ void drawOverlay(cv::Mat& frame, double fps, double latencyMs,
               cv::Point(12, 28), cv::FONT_HERSHEY_SIMPLEX, 0.55, green, 1);
   cv::putText(frame, cv::format("Detections: %d", detectionCount),
               cv::Point(12, 50), cv::FONT_HERSHEY_SIMPLEX, 0.55, green, 1);
-  cv::putText(frame, cv::format("Frame: %llu", static_cast<unsigned long long>(frameId)),
+  cv::putText(frame,
+              cv::format("Frame: %llu",
+                         static_cast<unsigned long long>(frameId)),
               cv::Point(12, 72), cv::FONT_HERSHEY_SIMPLEX, 0.55, green, 1);
 }
 
 int main() {
-  // Register signal handler for graceful shutdown
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
 
@@ -76,7 +75,6 @@ int main() {
   config.inferenceConfig.nmsThreshold = 0.45f;
   config.numWorkers = 2;
 
-  // Start pipeline
   Pipeline pipeline(config);
   pipeline.start();
 
@@ -85,31 +83,45 @@ int main() {
     return -1;
   }
 
+  // Start SSE + MJPEG server
+  SseServerConfig sseConfig;
+  sseConfig.port = 9001;
+  sseConfig.staticDir = "web/";
+  SseServer sseServer(sseConfig);
+  sseServer.start();
+
   std::cout << "Pipeline running. Press 'q' or Ctrl+C to stop.\n";
+  std::cout << "Dashboard: http://localhost:9001\n";
 
   FpsTracker fpsTracker;
 
-  // Main display loop — consume results and show detections
-  // Use tryPopFor to periodically check gShutdown flag (fixes SIGINT deadlock)
+  // Main display loop — sole consumer of result queue
+  // Sends data to both OpenCV window AND browser dashboard
   while (!gShutdown) {
     auto resultOpt =
         pipeline.resultQueue().tryPopFor(std::chrono::milliseconds(10));
-    if (!resultOpt) continue;  // timeout or empty — recheck gShutdown
+    if (!resultOpt) continue;
 
     auto& result = *resultOpt;
     fpsTracker.update();
 
-    // Draw detections on frame
+    // Draw overlays on frame
     drawDetections(result.frame, result.detections);
     drawOverlay(result.frame, fpsTracker.fps, result.inferenceLatencyMs,
                 static_cast<int>(result.detections.size()), result.frameId);
 
+    // Send to OpenCV display window
     cv::imshow("Video Analytics", result.frame);
+
+    // Send to browser dashboard (SSE JSON + MJPEG video)
+    auto json = serializeResult(result, fpsTracker.fps);
+    sseServer.broadcast(json.dump());
+    sseServer.updateFrame(result.frame);
 
     if (cv::waitKey(1) == 'q') break;
   }
 
-  // Cleanup
+  sseServer.stop();
   pipeline.stop();
   cv::destroyAllWindows();
 

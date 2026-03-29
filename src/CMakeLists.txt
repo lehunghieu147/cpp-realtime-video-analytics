@@ -6,6 +6,7 @@ add_executable(video_analytics
     inference/pre-process.cpp
     inference/post-process.cpp
     pipeline/pipeline.cpp
+    server/sse-server.cpp
 )
 
 # Link dependencies
@@ -14,6 +15,7 @@ target_link_libraries(video_analytics
         ${OpenCV_LIBS}
         ONNXRuntime::ONNXRuntime
         nlohmann_json::nlohmann_json
+        httplib::httplib
         pthread
 )
 
