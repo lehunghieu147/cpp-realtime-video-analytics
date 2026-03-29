@@ -67,9 +67,10 @@ int main() {
 
   // Configure pipeline
   PipelineConfig config;
-  config.captureConfig.deviceIndex = 0;
+  config.captureConfig.deviceIndex = 2;
   config.captureConfig.width = 640;
   config.captureConfig.height = 480;
+  config.captureConfig.codec = "MJPG";
   config.inferenceConfig.modelPath = "models/yolov8n.onnx";
   config.inferenceConfig.confidenceThreshold = 0.5f;
   config.inferenceConfig.nmsThreshold = 0.45f;
@@ -92,7 +93,7 @@ int main() {
   // Use tryPopFor to periodically check gShutdown flag (fixes SIGINT deadlock)
   while (!gShutdown) {
     auto resultOpt =
-        pipeline.resultQueue().tryPopFor(std::chrono::milliseconds(100));
+        pipeline.resultQueue().tryPopFor(std::chrono::milliseconds(10));
     if (!resultOpt) continue;  // timeout or empty — recheck gShutdown
 
     auto& result = *resultOpt;
