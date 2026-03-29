@@ -2,6 +2,9 @@
 add_executable(video_analytics
     main.cpp
     capture/opencv-capture.cpp
+    inference/inference-engine.cpp
+    inference/pre-process.cpp
+    inference/post-process.cpp
 )
 
 # Link dependencies
