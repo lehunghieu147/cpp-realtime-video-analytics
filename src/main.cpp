@@ -1,37 +1,17 @@
 #include <atomic>
-#include <chrono>
-#include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <opencv2/opencv.hpp>
 #include <thread>
 #include <vector>
 
-// ── FPS tracker ───────────────────────────────────────────────────────────────
-struct FpsTracker {
-  using Clock = std::chrono::steady_clock;
-  Clock::time_point timer = Clock::now();
-  int counter = 0;
-  double fps = 0.0;
-
-  void update() {
-    counter++;
-    auto now = Clock::now();
-    double elapsed = std::chrono::duration<double>(now - timer).count();
-    if (elapsed >= 1.0) {
-      fps = counter / elapsed;
-      counter = 0;
-      timer = now;
-    }
-  }
-};
+#include "capture/opencv-capture.hpp"
+#include "utils/fps-tracker.hpp"
 
 // ── All state for a single camera ─────────────────────────────────────────────
 struct CameraUnit {
-  int deviceIndex;
+  std::unique_ptr<IVideoCapture> capture;
   std::string label;
-  cv::VideoCapture cap;
   cv::VideoWriter writer;
   std::thread thread;
   FpsTracker tracker;
@@ -44,7 +24,7 @@ struct CameraUnit {
   std::atomic<bool> hasNew{false};
 };
 
-// ── Detect available cameras by probing device indices ────────────────────────
+// ── Detect available cameras ──────────────────────────────────────────────────
 std::vector<int> detectCameras(int maxIndex = 10) {
   std::vector<int> found;
   for (int i = 0; i < maxIndex; i++) {
@@ -57,13 +37,12 @@ std::vector<int> detectCameras(int maxIndex = 10) {
   return found;
 }
 
-// ── Grab thread: continuously captures frames from a camera ───────────────────
-void grabThread(CameraUnit &cam, std::atomic<bool> &running) {
+// ── Grab thread ───────────────────────────────────────────────────────────────
+void grabThread(CameraUnit& cam, std::atomic<bool>& running) {
   cv::Mat tmp;
   while (running) {
-    cam.cap >> tmp;
-    if (tmp.empty()) {
-      //std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!cam.capture->read(tmp)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
       continue;
     }
 
@@ -73,30 +52,8 @@ void grabThread(CameraUnit &cam, std::atomic<bool> &running) {
   }
 }
 
-// ── Camera setup helper ───────────────────────────────────────────────────────
-void setupCamera(cv::VideoCapture &cap) {
-  cap.set(cv::CAP_PROP_FOURCC,
-          cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
-  cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-  cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-  cap.set(cv::CAP_PROP_FPS, 30);
-  cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-}
-
-// ── Print actual camera properties ────────────────────────────────────────────
-void printCameraInfo(const CameraUnit &cam) {
-  int fourcc = static_cast<int>(cam.cap.get(cv::CAP_PROP_FOURCC));
-  char fmt[5] = {0};
-  std::memcpy(fmt, &fourcc, 4);
-  std::cout << cam.label << " (index " << cam.deviceIndex << "): "
-            << static_cast<int>(cam.cap.get(cv::CAP_PROP_FRAME_WIDTH)) << "x"
-            << static_cast<int>(cam.cap.get(cv::CAP_PROP_FRAME_HEIGHT)) << " @ "
-            << cam.cap.get(cv::CAP_PROP_FPS) << " FPS"
-            << " format=" << fmt << "\n";
-}
-
-// ── Draw overlay (FPS + frame count) onto display frame ──────────────────────
-void drawOverlay(cv::Mat &display, const std::string &label, double fps,
+// ── Draw overlay ──────────────────────────────────────────────────────────────
+void drawOverlay(cv::Mat& display, const std::string& label, double fps,
                  int frameCount) {
   cv::Scalar color(0, 255, 0);
   cv::rectangle(display, cv::Point(5, 5), cv::Point(290, 70),
@@ -119,30 +76,28 @@ int main() {
   std::cout << "Detected " << indices.size() << " camera(s)\n";
 
   // ── Initialize camera units ─────────────────────────────────────────────────
-  const int W = 640, H = 480;
   std::vector<std::unique_ptr<CameraUnit>> cameras;
 
   for (int idx : indices) {
     auto cam = std::make_unique<CameraUnit>();
-    cam->deviceIndex = idx;
     cam->label = "CAM" + std::to_string(idx);
 
-    cam->cap.open(idx);
-    if (!cam->cap.isOpened()) {
-      std::cerr << "Failed to open camera " << idx << ", skipping\n";
+    // Create capture via class — all config in CaptureConfig struct
+    CaptureConfig config;
+    config.deviceIndex = idx;
+    cam->capture = std::make_unique<OpenCvCapture>();
+    if (!cam->capture->open(config)) {
+      std::cerr << "Skipping camera " << idx << "\n";
       continue;
     }
+    std::cout << cam->capture->getInfo() << "\n";
 
-    setupCamera(cam->cap);
-    printCameraInfo(*cam);
-
-    double actualFps = cam->cap.get(cv::CAP_PROP_FPS);
-    if (actualFps <= 0) actualFps = 30.0;
-
+    // Video writer
+    double actualFps = cam->capture->getActualFps();
     std::string outPath = "output_cam" + std::to_string(idx) + ".avi";
     cam->writer = cv::VideoWriter(
         outPath, cv::VideoWriter::fourcc('X', 'V', 'I', 'D'),
-        actualFps, cv::Size(W, H), true);
+        actualFps, cv::Size(config.width, config.height), true);
 
     if (!cam->writer.isOpened()) {
       std::cerr << "Failed to open writer for camera " << idx << ", skipping\n";
@@ -159,7 +114,7 @@ int main() {
 
   // ── Start grab threads ──────────────────────────────────────────────────────
   std::atomic<bool> running{true};
-  for (auto &cam : cameras) {
+  for (auto& cam : cameras) {
     cam->thread = std::thread(grabThread, std::ref(*cam), std::ref(running));
   }
 
@@ -167,8 +122,7 @@ int main() {
 
   // ── Main loop ───────────────────────────────────────────────────────────────
   while (true) {
-    for (auto &cam : cameras) {
-      // Fetch latest frame if available
+    for (auto& cam : cameras) {
       if (cam->hasNew) {
         {
           std::lock_guard<std::mutex> lock(cam->mtx);
@@ -180,7 +134,6 @@ int main() {
         cam->writer.write(cam->latestFrame);
       }
 
-      // Display
       if (!cam->latestFrame.empty()) {
         drawOverlay(cam->latestFrame, cam->label, cam->tracker.fps,
                     cam->frameCount);
@@ -193,10 +146,10 @@ int main() {
 
   // ── Cleanup ─────────────────────────────────────────────────────────────────
   running = false;
-  for (auto &cam : cameras) {
+  for (auto& cam : cameras) {
     cam->thread.join();
     std::cout << cam->label << ": " << cam->frameCount << " frames saved\n";
-    cam->cap.release();
+    cam->capture->release();
     cam->writer.release();
   }
   cv::destroyAllWindows();
