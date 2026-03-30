@@ -1,119 +1,134 @@
-# Architecture
+# 🏗️ System Architecture
 
-## Thread Design
+This document details the internal design of the Real-time Video Analytics pipeline, focusing on its threading model, data lifecycle, and memory management strategies.
 
+## 🔄 Thread Design
+
+The system relies on a strictly decoupled, multi-threaded architecture to ensure that slow operations (like inference or network IO) do not block high-frequency operations (like camera capture).
+
+```mermaid
+graph TD
+    classDef thread fill:#2c3e50,stroke:#3498db,stroke-width:2px,color:#fff
+    classDef queue fill:#8e44ad,stroke:#9b59b6,stroke-width:2px,color:#fff
+    classDef output fill:#27ae60,stroke:#2ecc71,stroke-width:2px,color:#fff
+
+    A[🎥 Capture Thread<br/>Reads Native FPS]:::thread -->|Push Frame| B[(📦 Frame Queue<br/>Bounded: 8, Drop-oldest)]:::queue
+    
+    B -->|Pop Frame| C1[🧠 Inference Worker #0<br/>Own ORT Session]:::thread
+    B -->|Pop Frame| C2[🧠 Inference Worker #n<br/>Own ORT Session]:::thread
+    
+    C1 -->|Push Result| D[(📥 Result Queue<br/>Bounded: 16)]:::queue
+    C2 -->|Push Result| D
+    
+    D --> E[💻 cv::imshow<br/>Local GUI]:::output
+    D --> F[📡 SSE Server<br/>/events JSON]:::output
+    D --> G[📽️ MJPEG Stream<br/>/video]:::output
+    
+    F -->|Telemetry| H[🌐 Browser Dashboard<br/>Port 9001]
+    G -->|Frames| H
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
-│ Capture      │     │ Frame Queue  │     │ Inference Worker  │
-│ Thread       ├────►│ (bounded, 8) ├────►│ #0               │
-│              │     │ drop-oldest  │     │ (own ORT session) │
-│ reads USB    │     │              │  ┌──┤                   │
-│ camera at    │     └──────────────┘  │  └───────┬──────────┘
-│ native FPS   │                      │           │
-└──────────────┘     ┌──────────────┐  │  ┌───────▼──────────┐
-                     │ Result Queue │◄─┘  │ Inference Worker  │
-                     │ (bounded,16) │◄────┤ #1               │
-                     │              │     │ (own ORT session) │
-                     └──────┬───────┘     └──────────────────┘
-                            │
-              ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-         cv::imshow    SSE Server    MJPEG Stream
-         (local)       /events       /video
-                       (JSON)        (frames)
-                            │             │
-                            ▼             ▼
-                       Browser Dashboard (port 9001)
-```
 
-### Thread Responsibilities
+### 📋 Thread Responsibilities
 
-| Thread | Owner | Purpose |
+| Thread | Owner Method | Primary Purpose |
 |--------|-------|---------|
-| Capture | `Pipeline::captureLoop()` | Read frames from camera/video, push to frame queue |
-| Inference Worker N | `Pipeline::inferenceWorker(N)` | Pop frame, run YOLOv8 detection, push result |
-| HTTP Server | `SseServer::httpThread_` | Serve static files, SSE events, MJPEG stream |
-| Main | `main()` | Consume results, draw overlays, broadcast to SSE |
+| 🎥 **Capture** | `Pipeline::captureLoop()` | Reads frames from camera/video, pushes `FrameData` to the frame queue. Operates completely unblocked. |
+| 🧠 **Inference Worker(s)** | `Pipeline::inferenceWorker(N)` | Pops frames, executes YOLOv8 detection using ONNX, pushes `AnalyticsResult`. |
+| 🌐 **HTTP Server** | `SseServer::httpThread_` | Serves static files, manages SSE connections, and pushes the MJPEG stream asynchronously. |
+| 🖥️ **Main** | `main()` | Consumes results, draws overlays, broadcasts to SSE, and orchestrates shutdown. |
 
-### Why Session-per-Worker
+> [!NOTE]
+> **Why Session-per-Worker?**  
+> While ONNX Runtime sessions are technically thread-safe, concurrent `Run()` calls on a single session serialize internally. Providing each worker with its own dedicated session guarantees true parallelism.
 
-ONNX Runtime sessions are thread-safe for inference, but concurrent `Run()` calls on a single session serialize internally. Using one session per worker avoids contention and gives true parallelism.
+---
 
-## Data Flow
+## 🌊 Data Flow Lifecycle
 
+The data traverses a strict pipeline from raw pixels to actionable network telemetry.
+
+```mermaid
+flowchart TD
+    classDef data fill:#e67e22,stroke:#d35400,stroke-width:2px,color:#fff
+    classDef proc fill:#34495e,stroke:#2c3e50,stroke-width:2px,color:#fff
+    classDef out fill:#16a085,stroke:#1abc9c,stroke-width:2px,color:#fff
+
+    A[📸 Camera Frame<br/>cv::Mat BGR 640x480]:::data -->|captureLoop| B(FrameData<br/>frameId, captureTime, frame)
+    B -->|Push| C[(Bounded Queue<br/>FrameData)]
+    C -->|Pop| D{inferenceWorker}
+    
+    subgraph Inference Processing [YOLOv8 Inference Pipeline]
+        D -->|preProcess| E[HWC → CHW Tensor<br/>1x3x640x640 FP32]:::proc
+        E -->|Session::Run| F[Output Tensor<br/>1x84x8400]:::proc
+        F -->|postProcess| G[vector: Detection<br/>NMS & Config Filter]:::proc
+    end
+    
+    G --> H(AnalyticsResult<br/>frameId, frame, detections, latency):::data
+    H -->|Push| I[(Bounded Queue<br/>AnalyticsResult)]
+    
+    I -->|Pop| J((Main Loop Consumers))
+    
+    J --> K[🖌️ drawDetections]:::out
+    J --> L[📊 drawOverlay HUD]:::out
+    J --> M[💻 cv::imshow GUI]:::out
+    J --> N[📝 serializeResult JSON]:::out
+    J --> O[🌐 sseServer.broadcast]:::out
+    J --> P[📽️ sseServer.updateFrame]:::out
 ```
-Camera Frame (cv::Mat BGR 640x480)
-    │
-    ▼ captureLoop()
-FrameData { frameId, captureTime, frame }
-    │
-    ▼ push to BoundedQueue<FrameData>
-    │
-    ▼ inferenceWorker()
-    │
-    ├── preProcess(frame) → tensor (1x3x640x640 float32, normalized)
-    │   └── resize → BGR→RGB → HWC→CHW → normalize [0,1]
-    │
-    ├── session->Run(tensor) → output tensor (1x84x8400)
-    │
-    ├── postProcess(output) → vector<Detection>
-    │   └── transpose → confidence filter → NMS
-    │
-    ▼
-AnalyticsResult { frameId, frame, detections, latencyMs }
-    │
-    ▼ push to BoundedQueue<AnalyticsResult>
-    │
-    ▼ main loop consumes
-    │
-    ├── drawDetections() → bounding boxes on frame
-    ├── drawOverlay() → FPS/latency HUD
-    ├── cv::imshow() → local display
-    ├── serializeResult() → JSON
-    ├── sseServer.broadcast(json) → SSE clients
-    └── sseServer.updateFrame(frame) → MJPEG clients
-```
 
-## Buffer Management
+---
 
-### BoundedQueue
+## 📦 Buffer Management Strategy
 
-Thread-safe queue with configurable max size. When full, **drops the oldest item** to make room. This ensures:
-- Memory stays bounded regardless of producer/consumer speed mismatch
-- The system always processes the most recent frames (low latency over completeness)
-- No producer blocking — capture thread never stalls
+### The `BoundedQueue` Wrapper
+
+The core of our fast orchestration is a thread-safe queue featuring a configurable maximum size. When full, it **drops the oldest item** to create room for new inward traffic. 
+
+> [!IMPORTANT]
+> **Why Drop Oldest?**
+> - **Bounded Memory:** Prevents unbounded memory growth during producer/consumer speed mismatch events.
+> - **Real-Time Priority:** The system favors *low latency* (displaying the absolute newest frame) over *completeness* (processing every single frame in a backlog).
+> - **Unblocked Producers:** The capture thread never stalls waiting for the inference engine.
 
 ```cpp
-// Producer side (never blocks)
-queue.push(item);  // drops oldest if full
+// 🚀 Producer side (Never blocks!)
+queue.push(item);  // Quietly evicts oldest item if full
 
-// Consumer side (blocks until item available or stopped)
-auto item = queue.pop();       // blocking
-auto item = queue.tryPopFor(timeout);  // timed wait
+// 🛑 Consumer side (Blocks efficiently)
+auto item = queue.pop();                 // Blocking wait
+auto item = queue.tryPopFor(timeout_ms); // Timed wait
 ```
 
-### Queue Sizing
+### ⚙️ Queue Sizing Table
 
 | Queue | Default Size | Rationale |
-|-------|-------------|-----------|
-| Frame Queue | 8 | Small buffer between capture and inference |
-| Result Queue | 16 | Larger to absorb inference timing jitter |
-| Benchmark Mode | maxFrames+10 | No dropping — process every frame for accurate metrics |
+|-------|:---:|-----------|
+| 📥 **Frame Queue** | `8` | A deliberately tiny buffer between capture and inference ensures only the latest frames enter processing. |
+| 📤 **Result Queue** | `16` | A slightly larger buffer to absorb timing jitter between fast inference completions and slower SSE network flushes. |
+| 📊 **Benchmark Mode** | `maxFrames + 10` | Disables dropping. Forces the pipeline to process and evaluate *every* frame for accurate benchmarking. |
 
-## Error Handling
+---
 
-| Scenario | Behavior |
-|----------|----------|
-| Camera disconnect | 30 consecutive read failures → pipeline stops |
-| Video file EOF | Capture thread exits, queue stops, inference drains remaining frames |
-| Model load failure | Pipeline refuses to start, returns error |
-| SIGINT/SIGTERM | Global flag set, all loops exit gracefully |
+## 🛡️ Error Handling Mechanisms
 
-## HTTP Server Routes
+Fault tolerance is built deeply into the loops to ensure system resilience gracefully.
 
-| Route | Type | Description |
-|-------|------|-------------|
-| `/` | Static | Dashboard HTML page |
-| `/events` | SSE | JSON detection results stream |
-| `/video` | MJPEG | Live video frame stream |
-| `/app.js`, `/app.css` | Static | Dashboard assets |
+| Scenario | System Behavior |
+|----------|-----------------|
+| 🔌 **Camera Disconnect** | `30` consecutive read failures → pipeline halts intelligently. |
+| 🎬 **Video File EOF** | Capture thread exits naturally → frame queue stops → inference threads drain remaining frames before exiting. |
+| 💥 **Model Load Failure** | The pipeline refuses startup instantly and propagates the unrecoverable error. |
+| 🛑 **SIGINT / SIGTERM** (Ctrl+C) | Global atomic flag `Pipeline::stop()` is triggered. All thread loops exit their wait states gracefully without segfaults. |
+
+---
+
+## 📡 HTTP Server Routes (cpp-httplib)
+
+The embedded lightweight HTTP server (`cpp-httplib`) exposes the following topology:
+
+| Route Path | Content Type | Operational Description |
+|-------|:---:|-------------|
+| 🏠 `/` | Static HTML | Serves the interactive Dashboard HTML page. |
+| ⚡ `/events` | `text/event-stream` (SSE) | Server-Sent Events stream delivering continuous JSON telemetry and detection coordinates. |
+| 🎞️ `/video` | `multipart/x-mixed-replace` | Boundary-separated MJPEG stream carrying the real-time annotated video frames. |
+| 🎨 `/app.js`, `/app.css` | Static Assets | Serves compiled styling and JavaScript engine for the dashboard. |
