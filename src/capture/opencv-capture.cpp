@@ -7,7 +7,16 @@
 bool OpenCvCapture::open(const CaptureConfig& config) {
   config_ = config;
 
-  // cap_.open(config.deviceIndex, cv::CAP_V4L2);
+  // Open video file or camera device
+  if (!config.videoPath.empty()) {
+    cap_.open(config.videoPath);
+    if (!cap_.isOpened()) {
+      std::cerr << "Failed to open video: " << config.videoPath << "\n";
+      return false;
+    }
+    return true;  // skip codec/resolution settings for video files
+  }
+
   cap_.open(config.deviceIndex);
   if (!cap_.isOpened()) {
     std::cerr << "Failed to open camera " << config.deviceIndex << "\n";

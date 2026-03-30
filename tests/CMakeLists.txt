@@ -59,3 +59,21 @@ target_include_directories(test_serializer
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
         ${OpenCV_INCLUDE_DIRS}
 )
+
+# Test executable for latency tracker and benchmark report
+add_executable(test_latency_tracker
+    test-latency-tracker.cpp
+)
+
+# Link dependencies
+target_link_libraries(test_latency_tracker
+    PRIVATE
+        ${OpenCV_LIBS}
+)
+
+# Include directories
+target_include_directories(test_latency_tracker
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${OpenCV_INCLUDE_DIRS}
+)

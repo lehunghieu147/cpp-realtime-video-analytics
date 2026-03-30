@@ -1,10 +1,13 @@
 #include "pipeline/pipeline.hpp"
 #include "server/sse-server.hpp"
 #include "server/result-serializer.hpp"
+#include "benchmark/latency-tracker.hpp"
+#include "benchmark/benchmark-report.hpp"
 #include "inference/detection.hpp"
 #include "utils/fps-tracker.hpp"
 
 #include <csignal>
+#include <cstring>
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
@@ -60,11 +63,71 @@ void drawOverlay(cv::Mat& frame, double fps, double latencyMs,
               cv::Point(12, 72), cv::FONT_HERSHEY_SIMPLEX, 0.55, green, 1);
 }
 
-int main() {
-  std::signal(SIGINT, signalHandler);
-  std::signal(SIGTERM, signalHandler);
+// ── Benchmark mode ──────────────────────────────────────────────────────────
+int runBenchmark(const std::string& inputVideo, int maxFrames,
+                 const std::string& outputReport) {
+  std::cout << "Benchmark mode: " << inputVideo << " (" << maxFrames
+            << " frames)\n";
 
-  // Configure pipeline
+  PipelineConfig config;
+  config.captureConfig.videoPath = inputVideo;
+  config.inferenceConfig.modelPath = "models/yolov8n.onnx";
+  config.inferenceConfig.confidenceThreshold = 0.5f;
+  config.inferenceConfig.nmsThreshold = 0.45f;
+  config.numWorkers = 2;
+
+  Pipeline pipeline(config);
+  pipeline.start();
+
+  if (!pipeline.isRunning()) {
+    std::cerr << "Failed to start pipeline\n";
+    return -1;
+  }
+
+  LatencyTracker latency;
+  FpsTracker fpsTracker;
+  int frameCount = 0;
+
+  while (frameCount < maxFrames && !gShutdown) {
+    auto resultOpt =
+        pipeline.resultQueue().tryPopFor(std::chrono::milliseconds(500));
+    if (!resultOpt) {
+      // Video ended or pipeline stopped
+      if (!pipeline.isRunning()) break;
+      continue;
+    }
+
+    frameCount++;
+    latency.record(resultOpt->inferenceLatencyMs);
+    fpsTracker.update();
+
+    // Progress every 100 frames
+    if (frameCount % 100 == 0) {
+      std::cout << "  " << frameCount << "/" << maxFrames
+                << " frames (FPS: " << cv::format("%.1f", fpsTracker.fps)
+                << ")\n";
+    }
+  }
+
+  pipeline.stop();
+
+  // Print results
+  BenchmarkResults results;
+  results.fpsMean = fpsTracker.fps;
+  results.totalFrames = frameCount;
+  results.latency = latency;
+
+  std::cout << "\n" << generateReport(results);
+
+  if (!outputReport.empty()) {
+    writeReport(results, outputReport);
+  }
+
+  return 0;
+}
+
+// ── Live mode (camera + dashboard) ──────────────────────────────────────────
+int runLive() {
   PipelineConfig config;
   config.captureConfig.deviceIndex = 2;
   config.captureConfig.width = 640;
@@ -83,7 +146,6 @@ int main() {
     return -1;
   }
 
-  // Start SSE + MJPEG server
   SseServerConfig sseConfig;
   sseConfig.port = 9001;
   sseConfig.staticDir = "web/";
@@ -95,8 +157,6 @@ int main() {
 
   FpsTracker fpsTracker;
 
-  // Main display loop — sole consumer of result queue
-  // Sends data to both OpenCV window AND browser dashboard
   while (!gShutdown) {
     auto resultOpt =
         pipeline.resultQueue().tryPopFor(std::chrono::milliseconds(10));
@@ -105,15 +165,12 @@ int main() {
     auto& result = *resultOpt;
     fpsTracker.update();
 
-    // Draw overlays on frame
     drawDetections(result.frame, result.detections);
     drawOverlay(result.frame, fpsTracker.fps, result.inferenceLatencyMs,
                 static_cast<int>(result.detections.size()), result.frameId);
 
-    // Send to OpenCV display window
     cv::imshow("Video Analytics", result.frame);
 
-    // Send to browser dashboard (SSE JSON + MJPEG video)
     auto json = serializeResult(result, fpsTracker.fps);
     sseServer.broadcast(json.dump());
     sseServer.updateFrame(result.frame);
@@ -126,4 +183,56 @@ int main() {
   cv::destroyAllWindows();
 
   return 0;
+}
+
+// ── CLI parsing ─────────────────────────────────────────────────────────────
+void printUsage(const char* prog) {
+  std::cout << "Usage:\n"
+            << "  " << prog << "                        Live camera mode\n"
+            << "  " << prog << " --benchmark OPTIONS    Benchmark mode\n\n"
+            << "Benchmark options:\n"
+            << "  --input FILE     Input video file (required)\n"
+            << "  --frames N       Number of frames (default: 300)\n"
+            << "  --output FILE    Write report to file\n";
+}
+
+int main(int argc, char* argv[]) {
+  std::signal(SIGINT, signalHandler);
+  std::signal(SIGTERM, signalHandler);
+
+  // Parse CLI arguments
+  bool benchmarkMode = false;
+  std::string inputVideo;
+  int maxFrames = 300;
+  std::string outputReport;
+
+  for (int i = 1; i < argc; i++) {
+    if (std::strcmp(argv[i], "--benchmark") == 0) {
+      benchmarkMode = true;
+    } else if (std::strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
+      inputVideo = argv[++i];
+    } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+      maxFrames = std::stoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+      outputReport = argv[++i];
+    } else if (std::strcmp(argv[i], "--help") == 0) {
+      printUsage(argv[0]);
+      return 0;
+    }
+  }
+
+  if (benchmarkMode) {
+    if (inputVideo.empty()) {
+      std::cerr << "Error: --benchmark requires --input VIDEO_FILE\n";
+      printUsage(argv[0]);
+      return -1;
+    }
+    if (maxFrames <= 0) {
+      std::cerr << "Error: --frames must be positive\n";
+      return -1;
+    }
+    return runBenchmark(inputVideo, maxFrames, outputReport);
+  }
+
+  return runLive();
 }
