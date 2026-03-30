@@ -80,12 +80,19 @@ void Pipeline::stop() {
 }
 
 void Pipeline::captureLoop() {
+  bool isVideoFile = !config_.captureConfig.videoPath.empty();
   int failCount = 0;
   const int kMaxFails = 30;
 
   while (running_) {
     cv::Mat frame;
     if (!capture_->read(frame)) {
+      if (isVideoFile) {
+        // Video file ended — stop capture, let inference drain the queue
+        std::cout << "Pipeline: video ended after " << frameCounter_.load()
+                  << " frames\n";
+        break;
+      }
       failCount++;
       if (failCount >= kMaxFails) {
         std::cerr << "Pipeline: camera disconnected after " << kMaxFails
@@ -105,6 +112,11 @@ void Pipeline::captureLoop() {
     fd.frame = std::move(frame);
 
     frameQueue_.push(std::move(fd));
+  }
+
+  // For video files: signal queue stop so inference workers can drain and exit
+  if (isVideoFile) {
+    frameQueue_.stop();
   }
 }
 

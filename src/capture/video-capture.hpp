@@ -10,6 +10,7 @@ struct CaptureConfig {
   int fps = 30;
   std::string codec = "MJPG";
   int bufferSize = 1;
+  std::string videoPath;  // if set, open video file instead of camera
 };
 
 class IVideoCapture {

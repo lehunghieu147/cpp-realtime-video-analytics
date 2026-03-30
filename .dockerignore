@@ -1,0 +1,9 @@
+build/
+.cache/
+.claude/
+.git/
+.github/
+plans/
+docs/
+*.md
+src/main_bck.cpp
