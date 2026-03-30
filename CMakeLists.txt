@@ -20,6 +20,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(json)
 
+# cpp-httplib (header-only HTTP server library)
+FetchContent_Declare(
+    httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.18.7
+)
+FetchContent_MakeAvailable(httplib)
+
 # OpenCV — installed via system package manager (apt install libopencv-dev)
 find_package(OpenCV REQUIRED)
 

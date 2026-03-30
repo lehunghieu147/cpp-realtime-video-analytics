@@ -40,3 +40,22 @@ target_include_directories(test_pipeline
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
         ${OpenCV_INCLUDE_DIRS}
 )
+
+# Test executable for result serializer (JSON serialization)
+add_executable(test_serializer
+    test-serializer.cpp
+)
+
+# Link dependencies
+target_link_libraries(test_serializer
+    PRIVATE
+        ${OpenCV_LIBS}
+        nlohmann_json::nlohmann_json
+)
+
+# Include directories
+target_include_directories(test_serializer
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${OpenCV_INCLUDE_DIRS}
+)
