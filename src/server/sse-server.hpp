@@ -16,6 +16,7 @@ struct SseClients;
 // Main thread calls broadcast() and updateFrame() — no queue dependency.
 struct SseServerConfig {
   int port = 9001;
+  std::string bindAddress = "127.0.0.1";
   std::string staticDir = "web/";
 };
 

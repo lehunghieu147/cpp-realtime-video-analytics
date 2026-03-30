@@ -190,9 +190,9 @@ void SseServer::start() {
               }
             });
 
-    std::cout << "SSE server listening on http://localhost:" << config_.port
-              << "\n";
-    svr.listen("0.0.0.0", config_.port);
+    std::cout << "SSE server listening on http://" << config_.bindAddress << ":"
+              << config_.port << "\n";
+    svr.listen(config_.bindAddress, config_.port);
   });
 
   // Store clients pointer for broadcast() calls from main thread
